@@ -1,0 +1,86 @@
+.program n64_host
+
+; Repeatedly get one word of data from the TX FIFO, stalling when the FIFO is
+; empty. Write the least significant bit to the OUT pin group.
+
+; 1 NOP is 0.125uS
+
+entry:
+    SET PINS, 0 ; Set all pins low
+
+prepare_to_send:
+    ; Pull the command from the c program
+    PULL [23] ; Wait 23 cycles. I don't know why...
+    ; Prepare to write 8 bits
+    SET Y, 7
+
+send_loop:
+    ; Move 1 bit to send to X and jump to the high or low pattern segment
+    OUT X, 1
+    JMP !X send_0
+
+send_1:
+    SET PINDIRS, 1 [7] ; send low for 8
+    SET PINDIRS, 0 [20] ; send high for 24 (21 here + 3 more before next edge)
+    JMP Y-- send_loop
+    JMP send_stop [1]
+
+send_0:
+    SET PINDIRS, 1 [23] ; setting pindirs to output will cause it to be pulled low
+    SET PINDIRS, 0 [4]  ; setting to input will make it get pulled high
+    JMP Y-- send_loop
+    JMP send_stop [1]
+
+send_stop:
+    SET PINDIRS, 1 [7]
+    SET PINDIRS, 0  ; no need to dwell, we can just get ready to recieve right away
+
+prepare_to_receive:
+    SET Y, 31
+
+receive_loop:
+    ; wait for bus high
+    WAIT 1 PIN 0
+
+    ; Wait for falling edge, then delay 2 uS
+    WAIT 0 PIN 0 [15]
+
+    ; Read bit
+    IN PINS, 1 ; read 1 bit from input
+    JMP Y-- receive_loop ; decrement the bytes to read and loop if not zero
+    
+    ; wait for the stop bit
+    WAIT 1 PIN 0
+    WAIT 0 PIN 0
+    WAIT 1 PIN 0
+    
+    PUSH ; move data from input shift register to recieve fifo
+
+    ; return to waiting to send state
+    JMP prepare_to_send
+
+% c-sdk {
+static inline pio_sm_config n64_host_program_init(PIO pio, uint sm, uint offset, uint pin, float clkdiv) {
+    pio_sm_config c = n64_host_program_get_default_config(offset);
+
+    // Map the state machine's i/o pin groups to one pin, namely the `pin`
+    sm_config_set_in_pins(&c, pin);
+    sm_config_set_out_pins(&c, pin, 1);
+    sm_config_set_set_pins(&c, pin, 1);
+
+    sm_config_set_in_shift(&c, false, false, 32);
+    sm_config_set_out_shift(&c, false, false, 32);
+    
+    // Set this pin's GPIO function (connect PIO to the pad)
+    pio_gpio_init(pio, pin);
+    // Set the pin direction to input at the PIO
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+    sm_config_set_clkdiv(&c, clkdiv);
+
+    // Load our configuration, and jump to the start of the program
+    pio_sm_init(pio, sm, offset, &c);
+    // Set the state machine running
+    pio_sm_set_enabled(pio, sm, true);
+    return c;
+}
+%}
